@@ -1,0 +1,55 @@
+# ─── Entorno Python ──────────────────────────────────────────────────────────
+venv/
+.env
+.venv/
+env/
+
+# ─── Caché de Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+lib/
+lib64/
+
+# ─── Modelos descargables (Faster-Whisper) ───────────────────────────────────
+# Los modelos de Whisper se descargan automáticamente al ejecutar Jarvis.
+# run.sh los gestiona. Incluimos solo el directorio vacío como placeholder.
+models/
+!models/.gitkeep
+
+# ─── Archivos temporales de audio ────────────────────────────────────────────
+*.wav
+*.mp3
+*.flac
+*.ogg
+tmp/
+
+# ─── IDEs y editores ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.bak
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Systemd / servicios ─────────────────────────────────────────────────────
+*.service
+*.timer
+
+# ─── Configuración local ─────────────────────────────────────────────────────
+config.local.yml
+config.local.yaml
+config.local.json
+.secrets
