@@ -48,6 +48,15 @@ logs/
 *.service
 *.timer
 
+# ─── Artefactos locales ─────────────────────────────────────────────────────
+*.deb
+*.rpm
+
+# ─── Cobertura de tests ─────────────────────────────────────────────────────
+tests/coverage_html/
+.coverage
+htmlcov/
+
 # ─── Configuración local ─────────────────────────────────────────────────────
 config.local.yml
 config.local.yaml
