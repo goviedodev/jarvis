@@ -311,6 +311,68 @@ class JarvisBrain:
             print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
             return f"Lo siento, tuve un error: {e}"
 
+    def think_stream_tokens(self, user_input):
+        """
+        Streaming de Ollama: genera tokens y los retorna inmediatamente.
+        Para modo writer (escritura en tiempo real en consola).
+        """
+        # Mantener historial acotado
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(self.conversation_history)
+        messages.append({"role": "user", "content": user_input})
+
+        print(f"{Colors.MAGENTA}🤔 Pensando...{Colors.RESET}", end=" ", flush=True)
+        start = time.time()
+
+        try:
+            response = requests.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {
+                        "temperature": 0.7,
+                        "num_predict": 512,
+                    }
+                },
+                stream=True,
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            full_response = ""
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line.decode("utf-8"))
+                content = chunk.get("message", {}).get("content", "")
+                if not content:
+                    if chunk.get("done"):
+                        break
+                    continue
+
+                full_response += content
+                yield content  # Yield cada token inmediatamente
+
+            elapsed = time.time() - start
+            print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
+
+            # Actualizar historial
+            self.conversation_history.append({"role": "user", "content": user_input})
+            self.conversation_history.append({"role": "assistant", "content": full_response})
+
+        except requests.exceptions.ConnectionError:
+            print(f"{Colors.RED}❌ No se pudo conectar a Ollama{Colors.RESET}")
+            yield "Lo siento, no puedo conectar con mi cerebro en este momento."
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
+            yield f"Lo siento, tuve un error: {e}"
+
     def think_stream(self, user_input):
         """
         Streaming de Ollama: genera tokens y retorna oraciones completas
@@ -693,7 +755,7 @@ class VADManager:
 class Jarvis:
     """El asistente de voz definitivo."""
 
-    def __init__(self, model=None, whisper_model=None):
+    def __init__(self, model=None, whisper_model=None, writer_mode=False):
         self.audio = AudioManager()
         self.stt = SpeechRecognizer(model_size=whisper_model or WHISPER_MODEL_SIZE)
         self.brain = JarvisBrain(model=model or OLLAMA_MODEL)
@@ -703,6 +765,7 @@ class Jarvis:
         self._initialized = False
         self._use_push_to_talk = False
         self._mode = "text"  # text | ptt | vad
+        self.writer_mode = writer_mode
 
     def _check_push_to_talk(self):
         """Verifica si push-to-talk está disponible."""
@@ -729,7 +792,10 @@ class Jarvis:
         print(f"{Colors.RESET}")
         print(f"{Colors.CYAN}🧠 Modelo LLM: {self.brain.model}{Colors.RESET}")
         print(f"{Colors.CYAN}🎤 Modelo STT: Whisper {self.stt.model_size}{Colors.RESET}")
-        print(f"{Colors.CYAN}🔊 Modelo TTS: Piper (es_ES-davefx-medium){Colors.RESET}")
+        if self.writer_mode:
+            print(f"{Colors.YELLOW}✍️  Modo: ESCRITOR (texto en consola){Colors.RESET}")
+        else:
+            print(f"{Colors.CYAN}🔊 Modelo TTS: Piper (es_ES-davefx-medium){Colors.RESET}")
         print()
 
         # Verificar push-to-talk
@@ -738,9 +804,10 @@ class Jarvis:
         # Cargar Whisper
         self.stt.load()
 
-        # Verificar voz
-        if not self.tts.check_voice():
-            return False
+        # Verificar voz (solo si no estamos en modo escritor)
+        if not self.writer_mode:
+            if not self.tts.check_voice():
+                return False
 
         # Cargar VAD (modo silencioso si no se va a usar)
         self.vad.load()
@@ -794,24 +861,32 @@ class Jarvis:
         }
         return internal_map.get(choice, options[0][1].lower())
 
-    def process_query(self, text):
-        """Procesa una consulta de texto con streaming: LLM → TTS."""
+    def process_query(self, text, writer_mode=False):
+        """Procesa una consulta de texto con streaming: LLM → TTS o Writer."""
         if not text.strip():
             return
 
         print(f"\n{Colors.BOLD}{Colors.CYAN}🧑 Tú: {Colors.RESET}{text}")
 
-        full_response = ""
-        for sentence in self.brain.think_stream(text):
-            if sentence:
-                full_response += sentence + " "
-                # Enviar cada oración a TTS en hilo separado mientras
-                # Ollama sigue generando el resto de la respuesta
-                self.tts.speak_nonblocking(sentence)
+        if writer_mode:
+            # Modo escritor: streaming directo a consola
+            print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}", end="", flush=True)
+            for token in self.brain.think_stream_tokens(text):
+                print(token, end="", flush=True)
+            print()  # Nueva línea al final
+        else:
+            # Modo normal con TTS
+            full_response = ""
+            for sentence in self.brain.think_stream(text):
+                if sentence:
+                    full_response += sentence + " "
+                    # Enviar cada oración a TTS en hilo separado mientras
+                    # Ollama sigue generando el resto de la respuesta
+                    self.tts.speak_nonblocking(sentence)
 
-        full_response = full_response.strip()
-        if full_response:
-            print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{full_response}")
+            full_response = full_response.strip()
+            if full_response:
+                print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{full_response}")
 
     # ─── Modo 1: VAD (manos libres) ─────────────────────────────────────────
 
@@ -881,7 +956,7 @@ class Jarvis:
                             self.tts.speak("Historial de conversación limpiado.")
                             continue
 
-                        self.process_query(text)
+                        self.process_query(text, writer_mode=self.writer_mode)
 
                     print()
 
@@ -913,7 +988,7 @@ class Jarvis:
                 if not text:
                     continue
 
-                self.process_query(text)
+                self.process_query(text, writer_mode=self.writer_mode)
                 print()
 
             except KeyboardInterrupt:
@@ -985,7 +1060,7 @@ class Jarvis:
                         self.tts.speak("Historial de conversación limpiado.")
                         continue
 
-                    self.process_query(text)
+                    self.process_query(text, writer_mode=self.writer_mode)
                 print()
 
             except KeyboardInterrupt:
@@ -1049,6 +1124,7 @@ def main():
     parser.add_argument("--vad", action="store_true", help="Modo VAD (manos libres)")
     parser.add_argument("--ptt", action="store_true", help="Modo push-to-talk")
     parser.add_argument("--text", action="store_true", help="Modo texto")
+    parser.add_argument("--writer", action="store_true", help="Modo escritor (escribe en consola en lugar de hablar)")
 
     args = parser.parse_args()
 
@@ -1077,7 +1153,7 @@ def main():
         mode = "text"
 
     # Iniciar Jarvis
-    jarvis = Jarvis(model=args.model, whisper_model=args.whisper)
+    jarvis = Jarvis(model=args.model, whisper_model=args.whisper, writer_mode=args.writer)
     try:
         jarvis.initialize(mode=mode)
         jarvis.run()
