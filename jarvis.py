@@ -26,6 +26,7 @@ import tempfile
 import wave
 import subprocess
 import threading
+import queue
 import argparse
 from pathlib import Path
 
@@ -51,7 +52,7 @@ FORMAT = pyaudio.paInt16
 CHUNK = 1024
 
 # Whisper
-WHISPER_MODEL_SIZE = "large-v3"
+WHISPER_MODEL_SIZE = "large-v3-turbo"
 
 # Ollama
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -310,6 +311,82 @@ class JarvisBrain:
             print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
             return f"Lo siento, tuve un error: {e}"
 
+    def think_stream(self, user_input):
+        """
+        Streaming de Ollama: genera tokens y retorna oraciones completas
+        a medida que se generan, para enviarlas a TTS inmediatamente.
+        """
+        # Mantener historial acotado
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(self.conversation_history)
+        messages.append({"role": "user", "content": user_input})
+
+        print(f"{Colors.MAGENTA}🤔 Pensando...{Colors.RESET}", end=" ", flush=True)
+        start = time.time()
+
+        try:
+            response = requests.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {
+                        "temperature": 0.7,
+                        "num_predict": 512,
+                    }
+                },
+                stream=True,
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            buffer = ""
+            full_response = ""
+            sentence_endings = {".", "?", "!"}
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line.decode("utf-8"))
+                content = chunk.get("message", {}).get("content", "")
+                if not content:
+                    if chunk.get("done"):
+                        break
+                    continue
+
+                full_response += content
+                buffer += content
+
+                # Yield cuando detectamos final de oración (., ?, !)
+                if len(buffer) >= 5 and any(c in sentence_endings for c in buffer[-3:]):
+                    sentence = buffer.strip()
+                    if sentence:
+                        yield sentence
+                    buffer = ""
+
+            # Yield del texto restante (si no terminó con puntuación)
+            remaining = buffer.strip()
+            if remaining:
+                yield remaining
+
+            elapsed = time.time() - start
+            print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
+
+            # Actualizar historial
+            self.conversation_history.append({"role": "user", "content": user_input})
+            self.conversation_history.append({"role": "assistant", "content": full_response})
+
+        except requests.exceptions.ConnectionError:
+            print(f"{Colors.RED}❌ No se pudo conectar a Ollama{Colors.RESET}")
+            yield "Lo siento, no puedo conectar con mi cerebro en este momento."
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
+            yield f"Lo siento, tuve un error: {e}"
+
     def clear_history(self):
         """Limpia el historial de conversación."""
         self.conversation_history = []
@@ -326,6 +403,9 @@ class VoiceSynthesizer:
     def __init__(self, model_path=VOICE_MODEL, config_path=VOICE_CONFIG):
         self.model_path = model_path
         self.config_path = config_path
+        self._queue = queue.Queue()
+        self._worker = threading.Thread(target=self._tts_worker, daemon=True)
+        self._worker.start()
 
     def check_voice(self):
         """Verifica que el modelo de voz exista."""
@@ -406,11 +486,18 @@ class VoiceSynthesizer:
             print(f"{Colors.RED}❌ TTS Error: {e}{Colors.RESET}")
             return False
 
+    def _tts_worker(self):
+        """Worker que procesa la cola de TTS secuencialmente."""
+        while True:
+            text = self._queue.get()
+            if text is None:
+                break
+            self.speak(text)
+            self._queue.task_done()
+
     def speak_nonblocking(self, text):
-        """Habla en un hilo separado para no bloquear."""
-        thread = threading.Thread(target=self.speak, args=(text,), daemon=True)
-        thread.start()
-        return thread
+        """Encola texto para que el worker lo hable en orden."""
+        self._queue.put(text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -634,17 +721,23 @@ class Jarvis:
         return internal_map.get(choice, options[0][1].lower())
 
     def process_query(self, text):
-        """Procesa una consulta de texto: LLM → TTS."""
+        """Procesa una consulta de texto con streaming: LLM → TTS."""
         if not text.strip():
             return
 
         print(f"\n{Colors.BOLD}{Colors.CYAN}🧑 Tú: {Colors.RESET}{text}")
 
-        response = self.brain.think(text)
+        full_response = ""
+        for sentence in self.brain.think_stream(text):
+            if sentence:
+                full_response += sentence + " "
+                # Enviar cada oración a TTS en hilo separado mientras
+                # Ollama sigue generando el resto de la respuesta
+                self.tts.speak_nonblocking(sentence)
 
-        if response:
-            print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{response}")
-            self.tts.speak_nonblocking(response)
+        full_response = full_response.strip()
+        if full_response:
+            print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{full_response}")
 
     # ─── Modo 1: VAD (manos libres) ─────────────────────────────────────────
 
@@ -746,10 +839,7 @@ class Jarvis:
                 if not text:
                     continue
 
-                response = self.brain.think(text)
-                if response:
-                    print(f"{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{response}")
-                    self.tts.speak_nonblocking(response)
+                self.process_query(text)
                 print()
 
             except KeyboardInterrupt:
