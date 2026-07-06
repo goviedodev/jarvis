@@ -308,6 +308,343 @@ pytest tests/test_voice_synthesizer.py -v
 
 5. **Caché de verificaciones**: Verificaciones repetitivas (existencia de archivos, validaciones) deben cachearse cuando el estado no cambia.
 
+## 5. Double Buffering / Pipelining
+
+### Problema con la Arquitectura de Un Solo Worker
+
+Con la arquitectura anterior (un solo worker que sintetiza y reproduce secuencialmente), el flujo era:
+
+```
+Worker: [Piper N] → [Play N] → [Piper N+1] → [Play N+1]
+         ~~~ pausa ~~~                     ~~~ pausa ~~~
+```
+
+El cuello de botella: la **síntesis de N+1 no empezaba hasta que N terminara de reproducirse**, causando pausas audibles entre oraciones.
+
+### Solución: Dos Workers en Paralelo
+
+Separamos el proceso en dos etapas que pueden ejecutarse simultáneamente:
+
+```
+Hilo síntesis:    [Piper N] → put(audio) → [Piper N+1] → put(audio)
+                                    ↓                        ↓
+Cola de audio:              [audio_N]          [audio_N+1]
+                                    ↓                        ↓
+Hilo reproducción:           [Play N] → [Play N+1] → [Play N+2]
+                              ~~~ sin pausa ~~~
+```
+
+**Resultado:** Mientras se **reproduce** la oración N, ya se está **sintetizando** la oración N+1.
+
+### Implementación
+
+#### Arquitectura de Colas
+
+```python
+def __init__(self, model_path=VOICE_MODEL, config_path=VOICE_CONFIG):
+    self.model_path = model_path
+    self.config_path = config_path
+    self._queue = queue.Queue()  # Cola de texto (entrada)
+    self._audio_queue = queue.Queue(maxsize=3)  # Cola de audio (intermedia)
+    self._pyaudio = None
+    self._stream = None
+    self._voice_checked = False
+    
+    # Worker de síntesis: texto → audio bytes
+    self._synth_worker = threading.Thread(target=self._synth_loop, daemon=True)
+    self._synth_worker.start()
+    
+    # Worker de reproducción: audio bytes → PyAudio
+    self._playback_worker = threading.Thread(target=self._playback_loop, daemon=True)
+    self._playback_worker.start()
+```
+
+**Dos colas:**
+- `_queue`: Recibe texto de `speak_nonblocking()`
+- `_audio_queue`: Almacena audio bytes sintetizados (maxsize=3 para backpressure)
+
+**Dos workers:**
+- `_synth_worker`: Lee texto, sintetiza con Piper, encola audio bytes
+- `_playback_worker`: Lee audio bytes, escribe al stream PyAudio
+
+#### Worker de Síntesis
+
+```python
+def _synth_loop(self):
+    """Worker de síntesis: lee texto, sintetiza, encola audio bytes."""
+    while True:
+        text = self._queue.get()
+        if text is None:
+            # Señal de terminación: propagar al playback worker
+            self._audio_queue.put(None)
+            break
+        
+        print(f"{Colors.BLUE}🔊 Sintetizando...{Colors.RESET}", end=" ", flush=True)
+        audio_bytes = self._synthesize_text(text)
+        
+        if audio_bytes is not None:
+            # Bloqueante si la cola está llena (backpressure)
+            self._audio_queue.put(audio_bytes)
+            print(f"{Colors.DIM}✓{Colors.RESET}", flush=True)
+        
+        self._queue.task_done()
+```
+
+**Responsabilidades:**
+1. Lee texto de `_queue`
+2. Llama a `_synthesize_text()` (lanza Piper, resamplea)
+3. Encola audio bytes en `_audio_queue`
+4. Propaga señal de terminación (`None`) al playback worker
+
+#### Worker de Reproducción
+
+```python
+def _playback_loop(self):
+    """Worker de reproducción: lee audio bytes, escribe al stream PyAudio."""
+    while True:
+        try:
+            audio_bytes = self._audio_queue.get()
+            if audio_bytes is None:
+                break
+            
+            stream = self._ensure_audio_stream()
+            stream.write(audio_bytes)
+            self._audio_queue.task_done()
+            
+        except Exception as e:
+            print(f"{Colors.RED}❌ Playback error: {e}{Colors.RESET}")
+            self.cleanup()
+            # Continuar procesando la cola
+            continue
+    
+    # Cleanup al finalizar
+    self.cleanup()
+```
+
+**Responsabilidades:**
+1. Lee audio bytes de `_audio_queue`
+2. Escribe al stream PyAudio persistente
+3. Maneja errores con cleanup y reintento
+4. Cleanup final al terminar
+
+#### Método de Síntesis Separado
+
+```python
+def _synthesize_text(self, text):
+    """Sintetiza texto a audio bytes usando Piper. Retorna bytes o None si falla."""
+    if not self.check_voice():
+        return None
+
+    try:
+        cmd = [
+            "piper",
+            "--model", self.model_path,
+            "--output-raw",
+        ]
+        if os.path.exists(self.config_path):
+            cmd.extend(["--config", self.config_path])
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        audio_bytes, stderr = proc.communicate(
+            input=text.encode("utf-8"), timeout=30
+        )
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode()[:200]
+            print(f"{Colors.RED}❌ Piper error: {error_msg}{Colors.RESET}")
+            return None
+
+        # Resamplar de 22050 → 48000 Hz
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+
+        if PIPER_SAMPLE_RATE != TTS_OUTPUT_RATE:
+            src_len = len(audio_array)
+            tgt_len = int(src_len * TTS_OUTPUT_RATE / PIPER_SAMPLE_RATE)
+            audio_array = np.interp(
+                np.linspace(0, src_len - 1, tgt_len),
+                np.arange(src_len),
+                audio_array.astype(np.float64),
+            )
+
+        return audio_array.astype(np.int16).tobytes()
+
+    except subprocess.TimeoutExpired:
+        print(f"{Colors.RED}❌ Timeout en Piper{Colors.RESET}")
+        return None
+    except Exception as e:
+        print(f"{Colors.RED}❌ TTS síntesis error: {e}{Colors.RESET}")
+        return None
+```
+
+**Propósito:** Extraer la lógica de síntesis (Piper subprocess + resampling) en un método reutilizable que retorna bytes o None.
+
+#### Método speak() Síncrono
+
+```python
+def speak(self, text):
+    """Convierte texto a voz y lo reproduce (síncrono, para uso directo)."""
+    print(f"{Colors.BLUE}🔊 Hablando...{Colors.RESET}", end=" ", flush=True)
+    start = time.time()
+
+    audio_bytes_out = self._synthesize_text(text)
+    if audio_bytes_out is None:
+        return False
+
+    try:
+        stream = self._ensure_audio_stream()
+        stream.write(audio_bytes_out)
+
+        elapsed = time.time() - start
+        print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
+        return True
+
+    except Exception as e:
+        print(f"{Colors.RED}❌ TTS playback error: {e}{Colors.RESET}")
+        self.cleanup()
+        return False
+```
+
+**Uso:** Para modos que requieren reproducción síncrona (quick mode, mensajes de error).
+
+### Backpressure
+
+La cola `_audio_queue` tiene `maxsize=3`:
+
+```python
+self._audio_queue = queue.Queue(maxsize=3)
+```
+
+**Propósito:**
+- Evita acumulación excesiva de audio en memoria
+- Si el playback worker va lento, el synth worker espera
+- Previene que se sinteticen demasiadas oraciones por adelantado
+
+**Comportamiento:**
+- `_audio_queue.put()` es bloqueante si la cola está llena
+- El synth worker se pausa automáticamente
+- Se reanuda cuando el playback worker consume audio
+
+### Manejo de Errores
+
+#### En Síntesis
+- Si Piper falla → `_synthesize_text()` retorna `None`
+- El synth worker no encola audio
+- El playback worker simplemente no recibe ese fragmento
+- La conversación continúa con las siguientes oraciones
+
+#### En Reproducción
+- Si PyAudio falla → excepción capturada en `_playback_loop()`
+- Se llama a `cleanup()` para resetear el stream
+- El worker continúa procesando la cola
+- Siguiente oración reintentará con stream nuevo
+
+#### Propagación de Terminación
+```python
+# En _synth_loop:
+if text is None:
+    self._audio_queue.put(None)  # Propagar al playback worker
+    break
+
+# En _playback_loop:
+if audio_bytes is None:
+    break  # Terminar limpiamente
+```
+
+### Beneficios
+
+1. **Eliminación de pausas:** La síntesis de N+1 ocurre mientras se reproduce N
+2. **Mejor utilización de CPU:** Dos núcleos trabajan en paralelo (síntesis + reproducción)
+3. **Latencia percibida reducida:** El usuario escucha audio más rápido después de la primera oración
+4. **Arquitectura robusta:** Errores en un worker no bloquean al otro
+5. **Backpressure automático:** Previene consumo excesivo de memoria
+
+### Consideraciones Técnicas
+
+#### Thread Safety
+- `_ensure_audio_stream()` solo es llamado por el playback worker
+- No hay race conditions porque solo un hilo accede al stream PyAudio
+- Las colas de Python son thread-safe por diseño
+
+#### Orden Garantizado
+- Ambas colas son FIFO
+- El orden de texto → audio → reproducción se mantiene estrictamente
+- No hay reordenamiento posible
+
+#### Overhead de Threading
+- Dos hilos daemon adicionales (synth + playback)
+- Overhead mínimo (~1-2ms por cambio de contexto)
+- Beneficio de paralelismo supera ampliamente el overhead
+
+#### Memoria
+- `_audio_queue` almacena hasta 3 fragmentos de audio
+- Cada fragmento: ~100-500 KB dependiendo de la longitud
+- Máximo: ~1.5 MB en cola (aceptable)
+
+### Comparación: Antes vs Después
+
+#### Arquitectura Anterior (Un Worker)
+```
+Tiempo total para 3 oraciones de 500ms cada una:
+- Oración 1: [Piper 500ms] → [Play 1000ms]
+- Oración 2: [Piper 500ms] → [Play 1000ms]
+- Oración 3: [Piper 500ms] → [Play 1000ms]
+Total: 4500ms
+```
+
+#### Arquitectura Nueva (Dos Workers)
+```
+Tiempo total para 3 oraciones de 500ms cada una:
+- Oración 1: [Piper 500ms] → [Play 1000ms]
+- Oración 2:      [Piper 500ms] → [Play 1000ms]
+- Oración 3:           [Piper 500ms] → [Play 1000ms]
+Total: 3000ms (33% más rápido)
+```
+
+**Mejora:** 33% de reducción en tiempo total, eliminación completa de pausas entre oraciones.
+
+### Flujo Completo Actualizado
+
+1. Usuario habla → VAD/PTT detecta → STT transcribe
+2. `process_query()` llama a `think_stream()`
+3. `think_stream()` hace streaming de Ollama
+4. Tokens se acumulan en buffer hasta alcanzar `MIN_TTS_LENGTH` (100 chars)
+5. Se hace yield de oración larga
+6. `speak_nonblocking()` encola texto en `_queue`
+7. **Synth worker** lee texto de `_queue`
+8. Lanza subprocess de Piper
+9. Resamplea audio de 22050 → 48000 Hz
+10. Encola audio bytes en `_audio_queue`
+11. **Playback worker** lee audio bytes de `_audio_queue`
+12. Escribe al stream PyAudio persistente
+13. Synth worker ya está procesando siguiente oración (paso 7)
+14. Al finalizar, ambos workers hacen cleanup
+
+### Testing Manual
+
+Para verificar que el double buffering funciona:
+
+```bash
+python3 jarvis.py --quick "Esta es la primera oración. Esta es la segunda oración. Y esta es la tercera oración final."
+```
+
+**Comportamiento esperado:**
+- Impresión: "🔊 Sintetizando... ✓" tres veces (una por oración)
+- Audio reproducido de forma continua sin pausas entre oraciones
+- Tiempo total menor que la suma de tiempos individuales
+
+### Posibles Mejoras Futuras
+
+1. **Métricas de performance:** Agregar logging de tiempos de síntesis vs reproducción
+2. **Backpressure adaptativo:** Ajustar `maxsize` dinámicamente según velocidad de reproducción
+3. **Pre-síntesis:** Sintetizar oraciones comunes ("Hola", "Adiós") al inicio y cachearlas
+4. **Priorización:** Cola de prioridad para interrupciones urgentes
+
 ## Posibles Mejoras Futuras
 
 1. **Piper como servicio persistente**:

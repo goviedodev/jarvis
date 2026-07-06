@@ -401,17 +401,24 @@ class JarvisBrain:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class VoiceSynthesizer:
-    """Síntesis de voz con Piper TTS."""
+    """Síntesis de voz con Piper TTS usando double buffering."""
 
     def __init__(self, model_path=VOICE_MODEL, config_path=VOICE_CONFIG):
         self.model_path = model_path
         self.config_path = config_path
-        self._queue = queue.Queue()
+        self._queue = queue.Queue()  # Cola de texto
+        self._audio_queue = queue.Queue(maxsize=3)  # Cola de audio (backpressure)
         self._pyaudio = None
         self._stream = None
         self._voice_checked = False
-        self._worker = threading.Thread(target=self._tts_worker, daemon=True)
-        self._worker.start()
+        
+        # Worker de síntesis: texto → audio bytes
+        self._synth_worker = threading.Thread(target=self._synth_loop, daemon=True)
+        self._synth_worker.start()
+        
+        # Worker de reproducción: audio bytes → PyAudio
+        self._playback_worker = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_worker.start()
 
     def check_voice(self):
         """Verifica que el modelo de voz exista."""
@@ -436,13 +443,10 @@ class VoiceSynthesizer:
             )
         return self._stream
 
-    def speak(self, text):
-        """Convierte texto a voz y lo reproduce."""
+    def _synthesize_text(self, text):
+        """Sintetiza texto a audio bytes usando Piper. Retorna bytes o None si falla."""
         if not self.check_voice():
-            return False
-
-        print(f"{Colors.BLUE}🔊 Hablando...{Colors.RESET}", end=" ", flush=True)
-        start = time.time()
+            return None
 
         try:
             cmd = [
@@ -467,7 +471,7 @@ class VoiceSynthesizer:
             if proc.returncode != 0:
                 error_msg = stderr.decode()[:200]
                 print(f"{Colors.RED}❌ Piper error: {error_msg}{Colors.RESET}")
-                return False
+                return None
 
             # Resamplar de 22050 → 48000 Hz para compatibilidad con el dispositivo
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
@@ -481,9 +485,25 @@ class VoiceSynthesizer:
                     audio_array.astype(np.float64),
                 )
 
-            audio_bytes_out = audio_array.astype(np.int16).tobytes()
+            return audio_array.astype(np.int16).tobytes()
 
-            # Reproducir usando stream persistente
+        except subprocess.TimeoutExpired:
+            print(f"{Colors.RED}❌ Timeout en Piper{Colors.RESET}")
+            return None
+        except Exception as e:
+            print(f"{Colors.RED}❌ TTS síntesis error: {e}{Colors.RESET}")
+            return None
+
+    def speak(self, text):
+        """Convierte texto a voz y lo reproduce (síncrono, para uso directo)."""
+        print(f"{Colors.BLUE}🔊 Hablando...{Colors.RESET}", end=" ", flush=True)
+        start = time.time()
+
+        audio_bytes_out = self._synthesize_text(text)
+        if audio_bytes_out is None:
+            return False
+
+        try:
             stream = self._ensure_audio_stream()
             stream.write(audio_bytes_out)
 
@@ -491,14 +511,50 @@ class VoiceSynthesizer:
             print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
             return True
 
-        except subprocess.TimeoutExpired:
-            print(f"{Colors.RED}❌ Timeout en Piper{Colors.RESET}")
-            return False
         except Exception as e:
-            print(f"{Colors.RED}❌ TTS Error: {e}{Colors.RESET}")
-            # Resetear stream en caso de error
+            print(f"{Colors.RED}❌ TTS playback error: {e}{Colors.RESET}")
             self.cleanup()
             return False
+
+    def _synth_loop(self):
+        """Worker de síntesis: lee texto, sintetiza, encola audio bytes."""
+        while True:
+            text = self._queue.get()
+            if text is None:
+                # Señal de terminación: propagar al playback worker
+                self._audio_queue.put(None)
+                break
+            
+            print(f"{Colors.BLUE}🔊 Sintetizando...{Colors.RESET}", end=" ", flush=True)
+            audio_bytes = self._synthesize_text(text)
+            
+            if audio_bytes is not None:
+                # Bloqueante si la cola está llena (backpressure)
+                self._audio_queue.put(audio_bytes)
+                print(f"{Colors.DIM}✓{Colors.RESET}", flush=True)
+            
+            self._queue.task_done()
+
+    def _playback_loop(self):
+        """Worker de reproducción: lee audio bytes, escribe al stream PyAudio."""
+        while True:
+            try:
+                audio_bytes = self._audio_queue.get()
+                if audio_bytes is None:
+                    break
+                
+                stream = self._ensure_audio_stream()
+                stream.write(audio_bytes)
+                self._audio_queue.task_done()
+                
+            except Exception as e:
+                print(f"{Colors.RED}❌ Playback error: {e}{Colors.RESET}")
+                self.cleanup()
+                # Continuar procesando la cola
+                continue
+        
+        # Cleanup al finalizar
+        self.cleanup()
 
     def cleanup(self):
         """Cierra el stream y PyAudio. Llamar al finalizar o en error."""
@@ -512,17 +568,6 @@ class VoiceSynthesizer:
                 self._pyaudio = None
         except Exception:
             pass
-
-    def _tts_worker(self):
-        """Worker que procesa la cola de TTS secuencialmente."""
-        while True:
-            text = self._queue.get()
-            if text is None:
-                break
-            self.speak(text)
-            self._queue.task_done()
-        # Cleanup al finalizar
-        self.cleanup()
 
     def speak_nonblocking(self, text):
         """Encola texto para que el worker lo hable en orden."""
