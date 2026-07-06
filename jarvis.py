@@ -347,6 +347,7 @@ class JarvisBrain:
             buffer = ""
             full_response = ""
             sentence_endings = {".", "?", "!"}
+            MIN_TTS_LENGTH = 100  # agrupar oraciones cortas para reducir llamadas a Piper
 
             for line in response.iter_lines():
                 if not line:
@@ -362,11 +363,13 @@ class JarvisBrain:
                 buffer += content
 
                 # Yield cuando detectamos final de oración (., ?, !)
-                if len(buffer) >= 5 and any(c in sentence_endings for c in buffer[-3:]):
-                    sentence = buffer.strip()
-                    if sentence:
-                        yield sentence
-                    buffer = ""
+                # pero solo si el buffer es suficientemente largo
+                if any(c in sentence_endings for c in buffer[-3:]):
+                    if len(buffer) >= MIN_TTS_LENGTH:
+                        sentence = buffer.strip()
+                        if sentence:
+                            yield sentence
+                        buffer = ""
 
             # Yield del texto restante (si no terminó con puntuación)
             remaining = buffer.strip()
@@ -404,16 +407,34 @@ class VoiceSynthesizer:
         self.model_path = model_path
         self.config_path = config_path
         self._queue = queue.Queue()
+        self._pyaudio = None
+        self._stream = None
+        self._voice_checked = False
         self._worker = threading.Thread(target=self._tts_worker, daemon=True)
         self._worker.start()
 
     def check_voice(self):
         """Verifica que el modelo de voz exista."""
+        if self._voice_checked:
+            return True
         if not os.path.exists(self.model_path):
             print(f"{Colors.RED}❌ Voz no encontrada: {self.model_path}{Colors.RESET}")
             print(f"   Descarga una voz con: python3 download_voice.py")
             return False
+        self._voice_checked = True
         return True
+
+    def _ensure_audio_stream(self):
+        """Crea o reutiliza el stream de audio PyAudio."""
+        if self._pyaudio is None or self._stream is None:
+            self._pyaudio = pyaudio.PyAudio()
+            self._stream = self._pyaudio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=TTS_OUTPUT_RATE,
+                output=True,
+            )
+        return self._stream
 
     def speak(self, text):
         """Convierte texto a voz y lo reproduce."""
@@ -462,18 +483,9 @@ class VoiceSynthesizer:
 
             audio_bytes_out = audio_array.astype(np.int16).tobytes()
 
-            # Reproducir
-            p = pyaudio.PyAudio()
-            stream = p.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=TTS_OUTPUT_RATE,
-                output=True,
-            )
+            # Reproducir usando stream persistente
+            stream = self._ensure_audio_stream()
             stream.write(audio_bytes_out)
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
 
             elapsed = time.time() - start
             print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
@@ -484,7 +496,22 @@ class VoiceSynthesizer:
             return False
         except Exception as e:
             print(f"{Colors.RED}❌ TTS Error: {e}{Colors.RESET}")
+            # Resetear stream en caso de error
+            self.cleanup()
             return False
+
+    def cleanup(self):
+        """Cierra el stream y PyAudio. Llamar al finalizar o en error."""
+        try:
+            if self._stream is not None:
+                self._stream.stop_stream()
+                self._stream.close()
+                self._stream = None
+            if self._pyaudio is not None:
+                self._pyaudio.terminate()
+                self._pyaudio = None
+        except Exception:
+            pass
 
     def _tts_worker(self):
         """Worker que procesa la cola de TTS secuencialmente."""
@@ -494,6 +521,8 @@ class VoiceSynthesizer:
                 break
             self.speak(text)
             self._queue.task_done()
+        # Cleanup al finalizar
+        self.cleanup()
 
     def speak_nonblocking(self, text):
         """Encola texto para que el worker lo hable en orden."""

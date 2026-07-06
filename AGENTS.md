@@ -33,6 +33,7 @@ Spanish-language voice assistant ("JARVIS") — single-file Python project. Pipe
 - Config is hardcoded constants in `jarvis.py` (lines 36-75), not a config file.
 - Push-to-talk mode requires root (`sudo`) on Linux for global keyboard capture. Falls back to VAD mode or interactive text mode without root.
 - VAD (Voice Activity Detection) mode uses Silero VAD for hands-free activation. See [`docs/VAD_IMPLEMENTACION.md`](docs/VAD_IMPLEMENTACION.md) for the complete guide — architecture, chunk sizing, buffer strategy, tuning, and lessons learned during development.
+- TTS uses a queue-based architecture with a single worker thread to avoid audio overlap. PyAudio and streams are kept persistent to reduce overhead. See [`docs/TTS_OPTIMIZACION.md`](docs/TTS_OPTIMIZACION.md) for the complete optimization guide — queue pattern, persistent resources, sentence grouping, and tuning MIN_TTS_LENGTH.
 - Conversation history is capped at 10 messages (5 exchanges) for Ollama context.
 - TTS resamples Piper output from 22050 Hz to 48000 Hz for device playback.
 - Whisper model downloads to `models/` (gitignored). Voice models in `voices/` (also gitignored).
