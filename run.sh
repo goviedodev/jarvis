@@ -9,6 +9,16 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ─── Detectar modo pdev ──────────────────────────────────────────────
+# Si se pasa --pdev, usar pi CLI como backend LLM en lugar de Ollama
+USE_PDEV=false
+for arg in "$@"; do
+    if [ "$arg" = "--pdev" ]; then
+        USE_PDEV=true
+        break
+    fi
+done
+
 # ─── Usar el binario de Python del venv directamente ─────────────────────
 # NOTA: No usamos 'source venv/bin/activate' porque el venv fue creado en
 # otra ubicación y movido, por lo que el script de activación tiene rutas
@@ -37,12 +47,20 @@ DEPS_OK=true
 "$VENV_PYTHON" -c "import requests" 2>/dev/null || { echo "   ⚠️  requests no instalado"; DEPS_OK=false; }
 # Piper se usa como CLI, no como módulo Python
 command -v piper >/dev/null 2>&1 || { echo "   ⚠️  piper CLI no encontrado (pip install piper-tts)"; DEPS_OK=false; }
+
+# Si se usa --pdev, verificar que pi CLI esté disponible
+if [ "$USE_PDEV" = true ]; then
+    command -v pi >/dev/null 2>&1 || { echo "   ⚠️  pi CLI no encontrado (npm i -g @anthropic-ai/pi)"; DEPS_OK=false; }
+fi
 set -e
 
 if [ "$DEPS_OK" = false ]; then
     echo ""
     echo "⚠️  Faltan dependencias. Instálalas con:"
     echo "   $VENV_PIP install faster-whisper pyaudio requests piper-tts keyboard sounddevice"
+    if [ "$USE_PDEV" = true ]; then
+        echo "   npm i -g @anthropic-ai/pi  # Para modo --pdev"
+    fi
     echo ""
     echo "   Si pyaudio falla al compilar, instala el paquete del sistema:"
     echo "   sudo apt install python3-pyaudio"
@@ -66,18 +84,26 @@ print('  ✅ Voz descargada')
 "
 fi
 
-# ─── Verificar Ollama ──────────────────────────────────────────────────
-echo "🔍 Verificando Ollama..."
-if ! curl -s "http://localhost:11434/api/tags" > /dev/null 2>&1; then
-    echo "⚠️  Ollama no está corriendo."
-    echo "   Inicia Ollama con: ollama serve"
-    echo "   En otra terminal, o como servicio."
+# ─── Verificar Ollama (solo si NO se usa --pdev) ─────────────────────
+if [ "$USE_PDEV" = false ]; then
+    echo "🔍 Verificando Ollama..."
+    if ! curl -s "http://localhost:11434/api/tags" > /dev/null 2>&1; then
+        echo "⚠️  Ollama no está corriendo."
+        echo "   Inicia Ollama con: ollama serve"
+        echo "   En otra terminal, o como servicio."
+    fi
+else
+    echo "🔍 Modo pdev activado: usando pi CLI como backend LLM"
 fi
 
 echo ""
 echo "=============================================="
 echo "  🚀 Lanzando JARVIS..."
-echo "  Modelo LLM: ${JARVIS_MODEL:-qwen2.5-coder:7b}"
+if [ "$USE_PDEV" = true ]; then
+    echo "  Backend LLM: pi CLI (Gemini)"
+else
+    echo "  Modelo LLM: ${JARVIS_MODEL:-qwen2.5-coder:7b}"
+fi
 echo "  STT: Whisper large-v3-turbo (CUDA)"
 echo "  TTS: Piper es_ES-davefx-medium"
 echo "=============================================="

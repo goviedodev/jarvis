@@ -58,6 +58,10 @@ WHISPER_MODEL_SIZE = "large-v3-turbo"
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("JARVIS_MODEL", "qwen2.5-coder:7b")
 
+# Pi (backend alternativo LLM via CLI)
+PDEV_MODEL = os.environ.get("PDEV_MODEL", "google/gemini-2.5-flash")
+PDEV_SYSTEM_PROMPT_FILE = os.environ.get("PDEV_SYSTEM_PROMPT", os.path.join(BASE_DIR, "prompts", "pdev_system.md"))
+
 # TTS Piper
 PIPER_SAMPLE_RATE = 22050  # tasa nativa de Piper
 TTS_OUTPUT_RATE = 48000    # tasa de reproducción (la de tu dispositivo)
@@ -452,6 +456,75 @@ class JarvisBrain:
             print(f"{Colors.RED}❌ Error: {e}{Colors.RESET}")
             yield f"Lo siento, tuve un error: {e}"
 
+    def think_pi(self, user_input):
+        """
+        Usa pi CLI como backend LLM alternativo (modo --pdev).
+        Ejecuta: pi --model <model> --append-system-prompt <file> --no-tools -p <texto>
+        Retorna la respuesta como string.
+        """
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+
+        # Construir prompt con historial de conversación
+        context_parts = []
+        for msg in self.conversation_history:
+            role = "Usuario" if msg["role"] == "user" else "Jarvis"
+            context_parts.append(f"{role}: {msg['content']}")
+        context_parts.append(f"Usuario: {user_input}")
+        context = "\n".join(context_parts)
+
+        # Armar comando pi
+        cmd = [
+            "pi",
+            "--model", PDEV_MODEL,
+            "--no-tools",
+            "-p", context,
+        ]
+        if os.path.exists(PDEV_SYSTEM_PROMPT_FILE):
+            cmd.extend(["--append-system-prompt", PDEV_SYSTEM_PROMPT_FILE])
+
+        print(f"{Colors.MAGENTA}🤔 Pensando (pi + {PDEV_MODEL})...{Colors.RESET}", end=" ", flush=True)
+        start = time.time()
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            elapsed = time.time() - start
+            print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
+
+            if result.returncode != 0:
+                error_msg = (result.stderr or "Error desconocido")[:200]
+                print(f"{Colors.RED}❌ pi error: {error_msg}{Colors.RESET}")
+                return "Lo siento, tuve un error con mi cerebro alternativo."
+
+            response = result.stdout.strip()
+            if not response:
+                return "No recibí respuesta de mi cerebro alternativo."
+
+            # Actualizar historial
+            self.conversation_history.append({"role": "user", "content": user_input})
+            self.conversation_history.append({"role": "assistant", "content": response})
+
+            return response
+
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start
+            print(f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}")
+            print(f"{Colors.RED}❌ Timeout en pi (>60s){Colors.RESET}")
+            return "Lo siento, mi cerebro alternativo tardó demasiado en responder."
+        except FileNotFoundError:
+            print(f"{Colors.RED}❌ pi CLI no encontrado.{Colors.RESET}")
+            print(f"   Instalalo con: npm i -g @anthropic-ai/pi-coding-agent")
+            return "Lo siento, mi cerebro alternativo no está instalado."
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error en pi: {e}{Colors.RESET}")
+            return f"Lo siento, tuve un error con pi: {e}"
+
     def clear_history(self):
         """Limpia el historial de conversación."""
         self.conversation_history = []
@@ -755,7 +828,7 @@ class VADManager:
 class Jarvis:
     """El asistente de voz definitivo."""
 
-    def __init__(self, model=None, whisper_model=None, writer_mode=False):
+    def __init__(self, model=None, whisper_model=None, writer_mode=False, pdev_mode=False):
         self.audio = AudioManager()
         self.stt = SpeechRecognizer(model_size=whisper_model or WHISPER_MODEL_SIZE)
         self.brain = JarvisBrain(model=model or OLLAMA_MODEL)
@@ -766,6 +839,7 @@ class Jarvis:
         self._use_push_to_talk = False
         self._mode = "text"  # text | ptt | vad
         self.writer_mode = writer_mode
+        self.pdev_mode = pdev_mode
 
     def _check_push_to_talk(self):
         """Verifica si push-to-talk está disponible."""
@@ -790,8 +864,14 @@ class Jarvis:
         print("║    Just A Rather Very Intelligent System        ║")
         print("╚══════════════════════════════════════════════════╝")
         print(f"{Colors.RESET}")
-        print(f"{Colors.CYAN}🧠 Modelo LLM: {self.brain.model}{Colors.RESET}")
+        
+        if self.pdev_mode:
+            print(f"{Colors.CYAN}🧠 Modelo LLM: pi + {PDEV_MODEL}{Colors.RESET}")
+        else:
+            print(f"{Colors.CYAN}🧠 Modelo LLM: {self.brain.model}{Colors.RESET}")
+        
         print(f"{Colors.CYAN}🎤 Modelo STT: Whisper {self.stt.model_size}{Colors.RESET}")
+        
         if self.writer_mode:
             print(f"{Colors.YELLOW}✍️  Modo: ESCRITOR (texto en consola){Colors.RESET}")
         else:
@@ -861,14 +941,25 @@ class Jarvis:
         }
         return internal_map.get(choice, options[0][1].lower())
 
-    def process_query(self, text, writer_mode=False):
+    def process_query(self, text, writer_mode=False, pdev_mode=False):
         """Procesa una consulta de texto con streaming: LLM → TTS o Writer."""
         if not text.strip():
             return
 
         print(f"\n{Colors.BOLD}{Colors.CYAN}🧑 Tú: {Colors.RESET}{text}")
 
-        if writer_mode:
+        if pdev_mode:
+            # Modo pdev: usar pi CLI como backend LLM
+            response = self.brain.think_pi(text)
+            if writer_mode:
+                # Modo escritor + pdev: escribir respuesta completa
+                print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{response}")
+            else:
+                # Modo TTS + pdev: sintetizar respuesta
+                if response:
+                    print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{response}")
+                    self.tts.speak_nonblocking(response)
+        elif writer_mode:
             # Modo escritor: streaming directo a consola
             print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}", end="", flush=True)
             for token in self.brain.think_stream_tokens(text):
@@ -956,7 +1047,7 @@ class Jarvis:
                             self.tts.speak("Historial de conversación limpiado.")
                             continue
 
-                        self.process_query(text, writer_mode=self.writer_mode)
+                        self.process_query(text, writer_mode=self.writer_mode, pdev_mode=self.pdev_mode)
 
                     print()
 
@@ -988,7 +1079,7 @@ class Jarvis:
                 if not text:
                     continue
 
-                self.process_query(text, writer_mode=self.writer_mode)
+                self.process_query(text, writer_mode=self.writer_mode, pdev_mode=self.pdev_mode)
                 print()
 
             except KeyboardInterrupt:
@@ -1060,7 +1151,7 @@ class Jarvis:
                         self.tts.speak("Historial de conversación limpiado.")
                         continue
 
-                    self.process_query(text, writer_mode=self.writer_mode)
+                    self.process_query(text, writer_mode=self.writer_mode, pdev_mode=self.pdev_mode)
                 print()
 
             except KeyboardInterrupt:
@@ -1125,6 +1216,7 @@ def main():
     parser.add_argument("--ptt", action="store_true", help="Modo push-to-talk")
     parser.add_argument("--text", action="store_true", help="Modo texto")
     parser.add_argument("--writer", action="store_true", help="Modo escritor (escribe en consola en lugar de hablar)")
+    parser.add_argument("--pdev", action="store_true", help="Usar pi CLI (Gemini) como backend LLM en lugar de Ollama")
 
     args = parser.parse_args()
 
@@ -1153,7 +1245,7 @@ def main():
         mode = "text"
 
     # Iniciar Jarvis
-    jarvis = Jarvis(model=args.model, whisper_model=args.whisper, writer_mode=args.writer)
+    jarvis = Jarvis(model=args.model, whisper_model=args.whisper, writer_mode=args.writer, pdev_mode=args.pdev)
     try:
         jarvis.initialize(mode=mode)
         jarvis.run()
