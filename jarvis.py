@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 JARVIS - Asistente de Voz Inteligente para Linux
-Pipeline: Push-to-Talk → Faster-Whisper (STT) → Ollama (LLM) → Piper (TTS)
+Pipeline: VAD / Push-to-Talk → Faster-Whisper (STT) → Ollama (LLM) → Piper (TTS)
+
+Modos de entrada:
+  - VAD (Voice Activity Detection): Escucha continua, detecta cuando hablas
+  - Push-to-talk: Mantén ESPACIO para hablar
+  - Texto: Escribe tus consultas
 
 Uso:
-  python3 jarvis.py                    # Modo interactivo push-to-talk
+  python3 jarvis.py                    # Selección interactiva de modo
+  python3 jarvis.py --vad              # Modo VAD (manos libres)
+  python3 jarvis.py --ptt              # Modo push-to-talk
+  python3 jarvis.py --text             # Modo texto
   python3 jarvis.py --list-devices     # Listar dispositivos de audio
   python3 jarvis.py --test-mic         # Probar micrófono
   python3 jarvis.py --quick "texto"    # Solo sintetizar texto
@@ -52,6 +60,15 @@ OLLAMA_MODEL = os.environ.get("JARVIS_MODEL", "qwen2.5-coder:7b")
 # TTS Piper
 PIPER_SAMPLE_RATE = 22050  # tasa nativa de Piper
 TTS_OUTPUT_RATE = 48000    # tasa de reproducción (la de tu dispositivo)
+
+# ─── VAD (Voice Activity Detection) ──────────────────────────────────────────
+# Silero VAD trabaja con chunks de 30ms (480 samples) a 16000 Hz
+
+VAD_CHUNK_SIZE = 480       # 30ms a 16000 Hz
+VAD_SPEECH_THRESHOLD = 0.5 # probabilidad mínima para considerar voz
+VAD_MIN_SPEECH_CHUNKS = 6  # ~180ms de habla continua para activar grabación
+VAD_SILENCE_CHUNKS = 50    # ~1.5s de silencio para detener grabación
+VAD_TIMEOUT_SECS = 30      # timeout total de grabación en segundos
 
 # ─── Estilo de Jarvis ────────────────────────────────────────────────────────
 
@@ -397,6 +414,118 @@ class VoiceSynthesizer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  MÓDULO 5: VAD - Voice Activity Detection con Silero VAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VADManager:
+    """
+    Detección de actividad de voz usando Silero VAD.
+    Detecta cuándo una persona empieza y deja de hablar en tiempo real.
+    """
+
+    def __init__(self):
+        self.model = None
+        self._available = False
+        self.running = False
+
+    def load(self):
+        """Carga el modelo Silero VAD (bajo demanda)."""
+        if self.model is not None:
+            return
+
+        print(f"{Colors.DIM}📥 Cargando Silero VAD...{Colors.RESET}")
+        try:
+            import silero_vad
+            self.model = silero_vad.load_silero_vad()
+            self._available = True
+            print(f"{Colors.DIM}   ✅ VAD listo{Colors.RESET}")
+        except Exception as e:
+            self._available = False
+            print(f"{Colors.YELLOW}   ⚠️  VAD no disponible: {e}{Colors.RESET}")
+
+    @property
+    def available(self):
+        return self._available
+
+    def is_speech(self, audio_chunk):
+        """
+        Evalúa si un chunk de audio contiene voz.
+        audio_chunk: bytes de PCM int16 a 16000 Hz, 480 samples (30ms)
+        Retorna: True/False
+        """
+        if self.model is None:
+            return False
+
+        # Convertir bytes a tensor float32 normalizado [-1, 1]
+        audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+
+        import torch
+        audio_tensor = torch.from_numpy(audio_float32)
+
+        # Silero VAD espera [batch, samples] o [samples]
+        with torch.no_grad():
+            prob = self.model(audio_tensor, SAMPLE_RATE).item()
+
+        return prob > VAD_SPEECH_THRESHOLD
+
+    def listen_for_speech(self, stream, timeout_secs=VAD_TIMEOUT_SECS):
+        """
+        Escucha el stream hasta que detecta voz o se acaba el timeout.
+        Bufferiza los chunks que activan la detección para no perder audio.
+
+        Retorna:
+          frames: lista de bytes de audio con la voz detectada
+          total_chunks: número total de chunks procesados
+        """
+        speech_chunks = 0
+        total_chunks = 0
+        start_time = time.time()
+        # Buffer circular para no perder los chunks que activan la detección
+        pre_buffer = []
+
+        # 1. Esperar a que empiece a hablar
+        while self.running:
+            if time.time() - start_time > timeout_secs:
+                return [], total_chunks
+
+            data = stream.read(VAD_CHUNK_SIZE, exception_on_overflow=False)
+            total_chunks += 1
+
+            if self.is_speech(data):
+                speech_chunks += 1
+                pre_buffer.append(data)
+                if speech_chunks >= VAD_MIN_SPEECH_CHUNKS:
+                    break
+            else:
+                speech_chunks = 0
+                pre_buffer.clear()
+        else:
+            return [], total_chunks
+
+        # 2. Grabar hasta silencio prolongado (incluyendo buffer de activación)
+        frames = list(pre_buffer)
+        silence_chunks = 0
+
+        while self.running:
+            if time.time() - start_time > timeout_secs:
+                break
+
+            data = stream.read(VAD_CHUNK_SIZE, exception_on_overflow=False)
+            total_chunks += 1
+            frames.append(data)
+
+            if self.is_speech(data):
+                silence_chunks = 0
+            else:
+                silence_chunks += 1
+                if silence_chunks >= VAD_SILENCE_CHUNKS:
+                    break
+
+        return frames, total_chunks
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  JARVIS - El asistente completo
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -408,18 +537,19 @@ class Jarvis:
         self.stt = SpeechRecognizer(model_size=whisper_model or WHISPER_MODEL_SIZE)
         self.brain = JarvisBrain(model=model or OLLAMA_MODEL)
         self.tts = VoiceSynthesizer()
+        self.vad = VADManager()
         self.running = False
+        self._initialized = False
         self._use_push_to_talk = False
+        self._mode = "text"  # text | ptt | vad
 
     def _check_push_to_talk(self):
         """Verifica si push-to-talk está disponible."""
         try:
             import keyboard
-            # En Linux, keyboard necesita ser root para capturar teclas globales
             if os.geteuid() == 0:
                 self._use_push_to_talk = True
                 return True
-            # Si no es root, hay que verificar si el dispositivo de input es accesible
             if os.access('/dev/input', os.R_OK):
                 self._use_push_to_talk = True
                 return True
@@ -428,8 +558,8 @@ class Jarvis:
         self._use_push_to_talk = False
         return False
 
-    def initialize(self):
-        """Inicializa todos los componentes."""
+    def initialize(self, mode=None):
+        """Inicializa todos los componentes y selecciona modo."""
         print(f"{Colors.CLEAR}{Colors.BOLD}")
         print("╔══════════════════════════════════════════════════╗")
         print("║        🤖  J.A.R.V.I.S.  v1.0                  ║")
@@ -451,31 +581,155 @@ class Jarvis:
         if not self.tts.check_voice():
             return False
 
-        if not has_ptt:
-            print(f"{Colors.YELLOW}⚠️  Push-to-talk no disponible (requiere sudo).{Colors.RESET}")
-            print(f"{Colors.YELLOW}   Usando modo texto interactivo.{Colors.RESET}")
-            print(f"{Colors.YELLOW}   Para push-to-talk: sudo python3 jarvis.py{Colors.RESET}")
+        # Cargar VAD (modo silencioso si no se va a usar)
+        self.vad.load()
 
+        if mode:
+            self._mode = mode
+        else:
+            self._mode = self._select_mode(has_ptt)
+
+        if self._mode == "ptt" and not has_ptt:
+            print(f"{Colors.YELLOW}⚠️  Push-to-talk no disponible (sin sudo).{Colors.RESET}")
+            print(f"{Colors.YELLOW}   Usando VAD como alternativa.{Colors.RESET}")
+            if self.vad.available:
+                self._mode = "vad"
+            else:
+                self._mode = "text"
+
+        # Mostrar info del modo
+        mode_names = {"vad": "🎙️ VAD (manos libres)", "ptt": "⌨️ Push-to-talk", "text": "📝 Texto"}
+        print(f"{Colors.CYAN}🎯 Modo: {mode_names.get(self._mode, self._mode)}{Colors.RESET}")
+
+        self._initialized = True
         print(f"\n{Colors.GREEN}{Colors.BOLD}✅ Jarvis listo y operativo.{Colors.RESET}")
         return True
 
+    def _select_mode(self, has_ptt):
+        """Menú interactivo para seleccionar modo de entrada."""
+        print(f"\n{Colors.BOLD}Selecciona modo de entrada:{Colors.RESET}")
+
+        options = []
+        if self.vad.available:
+            options.append(("1", "VAD", "🎙️  Manos libres — escucha siempre, detecta cuando hablas"))
+        if has_ptt:
+            options.append(("2", "Push-to-talk", "⌨️   Mantén ESPACIO para hablar"))
+        options.append(("3", "Texto", "📝  Escribe tus consultas"))
+
+        for key, name, desc in options:
+            print(f"  [{key}] {desc}")
+
+        try:
+            choice = input(f"\n{Colors.CYAN}Modo (Enter={options[0][0]}): {Colors.RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = options[0][0]
+
+        mode_map = {opt[0]: opt[1].lower() for opt in options}
+        # Normalizar a clave interna
+        internal_map = {
+            "1": "vad", "2": "ptt", "3": "text",
+            "vad": "vad", "ptt": "ptt", "text": "text",
+            "": options[0][1].lower()
+        }
+        return internal_map.get(choice, options[0][1].lower())
+
     def process_query(self, text):
-        """
-        Procesa una consulta de texto: LLM → TTS.
-        """
+        """Procesa una consulta de texto: LLM → TTS."""
         if not text.strip():
             return
 
         print(f"\n{Colors.BOLD}{Colors.CYAN}🧑 Tú: {Colors.RESET}{text}")
 
-        # Pensar
         response = self.brain.think(text)
 
         if response:
             print(f"{Colors.BOLD}{Colors.GREEN}🤖 Jarvis: {Colors.RESET}{response}")
-
-            # Hablar (en hilo separado para no bloquear)
             self.tts.speak_nonblocking(response)
+
+    # ─── Modo 1: VAD (manos libres) ─────────────────────────────────────────
+
+    def vad_loop(self):
+        """
+        Modo manos libres con Silero VAD.
+        Escucha el micrófono continuamente y detecta cuándo hablas.
+        El stream de audio se mantiene abierto durante toda la sesión.
+        """
+        if not self.vad.available:
+            print(f"{Colors.RED}❌ VAD no disponible. Usa otro modo.{Colors.RESET}")
+            return
+
+        print(f"\n{Colors.BOLD}{Colors.GREEN}🎙️  MODO VAD — MANOS LIBRES{Colors.RESET}")
+        print(f"{Colors.YELLOW}   Solo habla. Jarvis te escucha y responde automáticamente.{Colors.RESET}")
+        print(f"{Colors.DIM}   Di 'salir' o 'terminar' para finalizar.{Colors.RESET}")
+        print(f"{Colors.DIM}   Ctrl+C para interrumpir.{Colors.RESET}")
+        print(f"{Colors.DIM}   (Sensibilidad: {VAD_SPEECH_THRESHOLD}, silencio: {VAD_SILENCE_CHUNKS/ (SAMPLE_RATE/VAD_CHUNK_SIZE):.1f}s){Colors.RESET}\n")
+
+        self.running = True
+        self.vad.running = True
+
+        # Abrir stream UNA VEZ para toda la sesión
+        stream = self.audio.p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            input_device_index=self.audio.device_index,
+            frames_per_buffer=VAD_CHUNK_SIZE,
+        )
+
+        try:
+            while self.running:
+                try:
+                    print(f"{Colors.DIM}  🎤 Esperando...{Colors.RESET}", end="\r")
+
+                    frames, total_chunks = self.vad.listen_for_speech(stream)
+
+                    if not frames:
+                        continue
+
+                    # Guardar audio a WAV temporal
+                    audio_bytes = b''.join(frames)
+                    duration = len(frames) * VAD_CHUNK_SIZE / SAMPLE_RATE
+
+                    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                    with wave.open(tmp.name, 'wb') as wf:
+                        wf.setnchannels(CHANNELS)
+                        wf.setsampwidth(2)
+                        wf.setframerate(SAMPLE_RATE)
+                        wf.writeframes(audio_bytes)
+
+                    print(f"{Colors.GREEN}  🎤 {duration:.1f}s detectados, transcribiendo...{Colors.RESET}  ")
+
+                    text = self.stt.transcribe(tmp.name)
+                    os.unlink(tmp.name)
+
+                    if text:
+                        text_lower = text.lower().strip()
+                        if text_lower in ("salir", "exit", "quit", "terminar", "adiós jarvis", "hasta luego"):
+                            print(f"\n{Colors.CYAN}👋 Hasta luego!{Colors.RESET}")
+                            self.running = False
+                            break
+                        elif "limpiar" in text_lower:
+                            self.brain.clear_history()
+                            self.tts.speak("Historial de conversación limpiado.")
+                            continue
+
+                        self.process_query(text)
+
+                    print()
+
+                except KeyboardInterrupt:
+                    self.running = False
+                    break
+                except Exception as e:
+                    print(f"\n{Colors.RED}❌ Error en VAD: {e}{Colors.RESET}")
+                    time.sleep(0.5)
+        finally:
+            self.vad.running = False
+            stream.stop_stream()
+            stream.close()
+
+    # ─── Modo 2: Push-to-talk ───────────────────────────────────────────────
 
     def interactive_mode(self):
         """Modo interactivo por teclado (sin push-to-talk)."""
@@ -578,12 +832,15 @@ class Jarvis:
 
     def run(self):
         """Punto de entrada principal."""
-        if not self.initialize():
-            return
+        if not self._initialized:
+            if not self.initialize():
+                return
 
         self.running = True
         try:
-            if self._use_push_to_talk:
+            if self._mode == "vad":
+                self.vad_loop()
+            elif self._mode == "ptt":
                 self.push_to_talk_loop()
             else:
                 self.interactive_mode()
@@ -625,6 +882,9 @@ def main():
     parser.add_argument("--quick", type=str, help="Sintetizar texto rápidamente")
     parser.add_argument("--model", type=str, help=f"Modelo Ollama (default: {OLLAMA_MODEL})")
     parser.add_argument("--whisper", type=str, help=f"Modelo Whisper (default: {WHISPER_MODEL_SIZE})")
+    parser.add_argument("--vad", action="store_true", help="Modo VAD (manos libres)")
+    parser.add_argument("--ptt", action="store_true", help="Modo push-to-talk")
+    parser.add_argument("--text", action="store_true", help="Modo texto")
 
     args = parser.parse_args()
 
@@ -643,9 +903,19 @@ def main():
         tts.speak(args.quick)
         return
 
+    # Determinar modo
+    mode = None
+    if args.vad:
+        mode = "vad"
+    elif args.ptt:
+        mode = "ptt"
+    elif args.text:
+        mode = "text"
+
     # Iniciar Jarvis
     jarvis = Jarvis(model=args.model, whisper_model=args.whisper)
     try:
+        jarvis.initialize(mode=mode)
         jarvis.run()
     except KeyboardInterrupt:
         print(f"\n{Colors.CYAN}👋 Hasta luego!{Colors.RESET}")
