@@ -17,11 +17,13 @@ Pipeline completo y local: **VAD → Faster-Whisper (STT) → Ollama (LLM) → P
 ## ✨ Características
 
 - **🎙️ 3 modos de entrada:** VAD (manos libres), Push-to-talk, o Texto
+- **🔊 2 modos de salida:** Voz (Piper TTS con streaming optimizado) o Escritor (texto en consola en tiempo real)
 - **🧠 Cerebro con IA local:** Ollama + Qwen 2.5 (privacidad total, sin internet)
 - **🎤 Reconocimiento de voz preciso:** Faster-Whisper large-v3 con GPU NVIDIA
 - **🔊 Voz natural en español:** Piper TTS con voz Davefx (es_ES)
 - **🏠 100% offline:** Todo corre en tu máquina, nada sube a la nube
 - **🖥️ Aceleración GPU:** CUDA para Whisper y CPU optimizada para VAD/TTS
+- **⚡ TTS optimizado:** Double buffering, PyAudio persistente y agrupación de oraciones para eliminar pausas
 
 ---
 
@@ -178,6 +180,40 @@ Escribe tus consultas directamente en la terminal.
 python3 jarvis.py --text
 ```
 
+### Modos de salida
+
+#### 🔊 Modo voz (default)
+
+Jarvis responde hablando usando Piper TTS. El audio se procesa con double buffering para minimizar pausas entre oraciones.
+
+```bash
+python3 jarvis.py --vad              # VAD + voz
+python3 jarvis.py --text             # Texto + voz
+sudo python3 jarvis.py --ptt         # PTT + voz
+```
+
+#### ✍️ Modo escritor
+
+Jarvis escribe las respuestas en la consola en tiempo real, token por token mientras el LLM las genera. Ideal para entornos silenciosos, sesiones SSH, o cuando prefieres leer en lugar de escuchar.
+
+```bash
+python3 jarvis.py --vad --writer     # VAD + escritor
+python3 jarvis.py --text --writer    # Texto + escritor
+sudo python3 jarvis.py --ptt --writer # PTT + escritor
+```
+
+**Casos de uso del modo escritor:**
+- Entornos de oficina silenciosos
+- Sesiones SSH remotas sin audio
+- Pruebas rápidas de prompts sin esperar audio
+- Documentación automática (puedes redirigir salida a archivo)
+- Integración con tmux/screen
+
+**Ventajas del modo escritor:**
+- ⚡ Latencia mínima: primer token en ~200ms (vs ~800ms en TTS)
+- 💾 Menos memoria: no carga Piper (~200MB ahorrados)
+- 🚀 Inicio más rápido: evita descarga/verificación de modelos TTS
+
 ### Comandos de voz
 
 Durante la conversación, puedes decir:
@@ -195,6 +231,7 @@ Durante la conversación, puedes decir:
 | `--vad` | Modo VAD (manos libres) |
 | `--ptt` | Modo push-to-talk |
 | `--text` | Modo texto |
+| `--writer` | Modo escritor (escribe en consola en lugar de hablar) |
 | `--model <nombre>` | Modelo Ollama (ej: `qwen3.5:9b`) |
 | `--whisper <tamaño>` | Tamaño de Whisper (ej: `medium`, `small`) |
 | `--quick "<texto>"` | Sintetizar texto y salir |
@@ -209,17 +246,38 @@ Durante la conversación, puedes decir:
                     ┌──────────────────────────────────────────┐
                     │              JARVIS                       │
                     │                                          │
-  🎤 Micrófono ────▶│  ┌──────────┐  ┌──────────┐  ┌───────┐  │───▶ 🔊 Parlantes
-                    │  │   VAD    │─▶│  Whisper │─▶│ Ollama│  │     │
-                    │  │  Silero  │  │  STT GPU │  │  LLM  │  │     │
-                    │  └──────────┘  └──────────┘  └───┬───┘  │     │
-                    │                                  │       │     │
-                    │                           ┌──────▼───┐  │     │
-                    │                           │ Piper TTS│──┘     │
-                    │                           └──────────┘        │
-                    └──────────────────────────────────────────────┘
-                              Todo corre LOCAL
+  🎤 Micrófono ────▶│  ┌──────────┐  ┌──────────┐  ┌───────┐  │
+                    │  │   VAD    │─▶│  Whisper │─▶│ Ollama│  │
+                    │  │  Silero  │  │  STT GPU │  │  LLM  │  │
+                    │  └──────────┘  └──────────┘  └───┬───┘  │
+                    │                                  │       │
+                    │                    ┌─────────────┴─────┐ │
+                    │                    │                   │ │
+                    │              ┌─────▼─────┐      ┌────▼───┐
+                    │              │ Piper TTS │      │Writer  │
+                    │              │  (voz)    │      │(texto) │
+                    │              └─────┬─────┘      └────┬───┘
+                    │                    │                 │
+                    └────────────────────┼─────────────────┼───┘
+                                         │                 │
+                              ┌──────────▼──┐         ┌───▼────────┐
+                              │ 🔊 Parlantes│         │ 📺 Consola │
+                              └─────────────┘         └────────────┘
 ```
+
+### Modos de salida
+
+**Modo TTS (voz):**
+- Streaming de Ollama → agrupación de oraciones (MIN_TTS_LENGTH=100 chars)
+- Cola de síntesis → Worker de Piper → Cola de audio → Worker de reproducción
+- Double buffering: sintetiza N+1 mientras reproduce N
+- PyAudio persistente: elimina overhead de inicialización
+- Resampling automático: 22050 Hz → 48000 Hz
+
+**Modo escritor (texto):**
+- Streaming de Ollama → tokens individuales
+- Escritura directa a stdout sin buffering
+- Latencia mínima: primer token en ~200ms
 
 ### Módulos
 
