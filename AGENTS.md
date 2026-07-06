@@ -5,7 +5,7 @@ Spanish-language voice assistant ("JARVIS") — single-file Python project. Pipe
 ## Running
 
 - `./run.sh` — main entry point. Handles venv activation, dependency check, voice model download, and Ollama check. Passes args through to `jarvis.py`.
-- `python3 jarvis.py` — run directly if venv is already active. Args: `--list-devices`, `--test-mic`, `--quick "text"`, `--model <ollama-model>`, `--whisper <model-size>`.
+- `python3 jarvis.py` — run directly if venv is already active. Args: `--vad`, `--ptt`, `--text`, `--list-devices`, `--test-mic`, `--quick "text"`, `--model <ollama-model>`, `--whisper <model-size>`.
 - `python3 stt_test.py` — standalone STT test (records + transcribes).
 - `python3 tts_test.py` — standalone TTS test (synthesizes + plays).
 
@@ -23,14 +23,14 @@ Spanish-language voice assistant ("JARVIS") — single-file Python project. Pipe
 ## Setup
 
 1. Create venv: `python3 -m venv venv`
-2. Activate and install: `source venv/bin/activate && pip install faster-whisper pyaudio requests piper-tts keyboard sounddevice numpy`
+2. Activate and install: `source venv/bin/activate && pip install faster-whisper pyaudio requests piper-tts keyboard sounddevice numpy silero-vad torch torchaudio --index-url https://download.pytorch.org/whl/cu124`
 3. Start Ollama in another terminal: `ollama serve`
 4. Voice model and Whisper model auto-download on first run via `run.sh`.
 
 ## Key Architecture Notes
 
-- All code lives in `jarvis.py` (~658 lines). Five classes: `AudioManager`, `SpeechRecognizer`, `JarvisBrain`, `VoiceSynthesizer`, `VADManager`, orchestrated by `Jarvis`.
-- Config is hardcoded constants in `jarvis.py` (lines 28-54), not a config file.
+- All code lives in `jarvis.py` (928 lines). Five classes: `AudioManager`, `SpeechRecognizer`, `JarvisBrain`, `VoiceSynthesizer`, `VADManager`, orchestrated by `Jarvis`.
+- Config is hardcoded constants in `jarvis.py` (lines 36-75), not a config file.
 - Push-to-talk mode requires root (`sudo`) on Linux for global keyboard capture. Falls back to VAD mode or interactive text mode without root.
 - VAD (Voice Activity Detection) mode uses Silero VAD for hands-free activation. See [`docs/VAD_IMPLEMENTACION.md`](docs/VAD_IMPLEMENTACION.md) for the complete guide — architecture, chunk sizing, buffer strategy, tuning, and lessons learned during development.
 - Conversation history is capped at 10 messages (5 exchanges) for Ollama context.
