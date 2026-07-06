@@ -64,7 +64,7 @@ TTS_OUTPUT_RATE = 48000    # tasa de reproducción (la de tu dispositivo)
 # ─── VAD (Voice Activity Detection) ──────────────────────────────────────────
 # Silero VAD trabaja con chunks de 30ms (480 samples) a 16000 Hz
 
-VAD_CHUNK_SIZE = 480       # 30ms a 16000 Hz
+VAD_CHUNK_SIZE = 512       # 32ms a 16000 Hz (mínimo requerido por Silero VAD)
 VAD_SPEECH_THRESHOLD = 0.5 # probabilidad mínima para considerar voz
 VAD_MIN_SPEECH_CHUNKS = 6  # ~180ms de habla continua para activar grabación
 VAD_SILENCE_CHUNKS = 50    # ~1.5s de silencio para detener grabación
