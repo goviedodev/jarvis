@@ -519,7 +519,7 @@ class JarvisBrain:
             return "Lo siento, mi cerebro alternativo tardó demasiado en responder."
         except FileNotFoundError:
             print(f"{Colors.RED}❌ pi CLI no encontrado.{Colors.RESET}")
-            print(f"   Instalalo con: npm i -g @anthropic-ai/pi-coding-agent")
+            print(f"   Instalalo con: npm i -g @earendil-works/pi-coding-agent")
             return "Lo siento, mi cerebro alternativo no está instalado."
         except Exception as e:
             print(f"{Colors.RED}❌ Error en pi: {e}{Colors.RESET}")

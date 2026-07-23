@@ -50,7 +50,7 @@ command -v piper >/dev/null 2>&1 || { echo "   ⚠️  piper CLI no encontrado (
 
 # Si se usa --pdev, verificar que pi CLI esté disponible
 if [ "$USE_PDEV" = true ]; then
-    command -v pi >/dev/null 2>&1 || { echo "   ⚠️  pi CLI no encontrado (npm i -g @anthropic-ai/pi)"; DEPS_OK=false; }
+    command -v pi >/dev/null 2>&1 || { echo "   ⚠️  pi CLI no encontrado (npm i -g @earendil-works/pi-coding-agent)"; DEPS_OK=false; }
 fi
 set -e
 
@@ -59,7 +59,7 @@ if [ "$DEPS_OK" = false ]; then
     echo "⚠️  Faltan dependencias. Instálalas con:"
     echo "   $VENV_PIP install faster-whisper pyaudio requests piper-tts keyboard sounddevice"
     if [ "$USE_PDEV" = true ]; then
-        echo "   npm i -g @anthropic-ai/pi  # Para modo --pdev"
+        echo "   npm i -g @earendil-works/pi-coding-agent  # Para modo --pdev"
     fi
     echo ""
     echo "   Si pyaudio falla al compilar, instala el paquete del sistema:"
