@@ -1,8 +1,16 @@
 # 🤖 J.A.R.V.I.S.
 
-**Just A Rather Very Intelligent System** — Asistente de voz inteligente para Linux.
+<sup>*Just A Rather Very Intelligent System*</sup>
+
+**Un asistente de voz en español que no le manda una sola palabra a la nube.**
+
+Whisper escucha, Qwen piensa, Piper contesta — todo dentro de tu máquina.
+Sin API keys, sin telemetría, sin conexión.
 
 Pipeline completo y local: **VAD → Faster-Whisper (STT) → Ollama (LLM) → Piper (TTS)**
+
+> Construido entre las 23:53 y las 04:06 de una misma madrugada, con un agente de IA
+> como par de programación. → [La historia](#-la-historia)
 
 <p align="center">
   <img src="https://img.shields.io/badge/STT-Faster--Whisper%20large--v3--turbo-blue" alt="STT">
@@ -501,6 +509,72 @@ piper             → CLI de síntesis de voz, se invoca como subproceso
 pi                → CLI de LLM, solo para --pdev (npm i -g @earendil-works/pi-coding-agent)
 pytest            → Solo para correr la suite de tests
 ```
+
+---
+
+## 🌙 La historia
+
+Este proyecto no se planificó. Empezó a las **23:53** de un domingo con un par de
+scripts sueltos para averiguar si el micrófono andaba y si Piper sonaba. Terminó a las
+**04:06** con Jarvis contestando en español, sin internet, con la voz saliendo de mi
+propia GPU.
+
+Cuatro horas y doce minutos. Doce commits. Uno cada diecisiete minutos.
+
+**00:33 — v1.0.** El primer commit no fue un esqueleto: entró el pipeline entero de una
+sola vez. 1617 líneas con push-to-talk, Whisper sobre CUDA, Ollama y Piper ya hablando.
+Andaba.
+
+**00:43 — Manos libres.** Diez minutos después, Silero VAD. Jarvis dejó de necesitar que
+le apretaran una tecla para escuchar.
+
+**00:57 — El primer golpe.** `ValueError: Input audio chunk is too short`. Nada más. Yo
+había elegido chunks de 480 samples porque 30 ms era un número redondo; Silero exige 512
+como mínimo absoluto y no lo dice en ningún lugar obvio. Un error de una línea contra una
+constante mal elegida.
+
+**02:07 — "Habla tres veces".** El bug más ridículo de la noche y el más instructivo.
+Cada oración que generaba el LLM lanzaba su propio hilo de síntesis, y cada hilo abría su
+propio stream de audio. Con tres oraciones, tres voces encimadas hablando al mismo
+tiempo. La solución fue tirar los hilos y poner una cola con un solo worker.
+
+**02:09 — Tests.** Dos minutos después del fix: 87 casos, con todo el hardware mockeado.
+Terminé la noche con más líneas de test que de aplicación.
+
+**02:37 — La decisión que cambió el proyecto.** El worker único resolvía el solapamiento
+pero traía pausas: la oración N+1 no empezaba a sintetizarse hasta que la N terminaba de
+sonar. Partí el trabajo en dos hilos —uno sintetiza, otro reproduce— con una cola de tres
+buffers en el medio. Jarvis dejó de sonar como un robot leyendo y empezó a sonar como
+alguien hablando.
+
+**04:04 — Lo último.** Un backend alternativo: si no tenés GPU para un modelo local,
+Jarvis puede delegarle el razonamiento a un CLI de IA.
+
+**04:06 — Merge. A dormir.**
+
+### Sobre construir con IA
+
+Trabajé toda la noche con un agente de IA como par de programación y no tiene sentido
+esconderlo: quedaron `AGENTS.md` y `CLAUDE.md` en el repo, que son archivos de contexto
+para el agente.
+
+Pero hay un detalle de esa noche que dice más que cualquier declaración. A las 00:57
+escribí `AGENTS.md` para que el agente entendiera la arquitectura. A las 01:15
+—dieciocho minutos después— tuve que commitear esto:
+
+> `fix: update AGENTS.md with verified facts from codebase`
+
+El archivo de contexto se había desincronizado del código real. El agente no se dio
+cuenta solo: me di cuenta yo, leyendo.
+
+Eso resume bastante bien cómo fue. La IA sostuvo una velocidad que yo solo no sostengo a
+las dos de la mañana. Pero las decisiones —cuántos buffers, dónde cortar el silencio, qué
+modelo entra en 12 GB de VRAM— y la verificación de que lo escrito fuera cierto siguieron
+siendo mías.
+
+El resultado son 1260 líneas de aplicación, 1787 de tests y 1204 de documentación
+técnica, escritas entre la medianoche y las cuatro de la mañana. No porque tipee rápido,
+sino porque dejé de tipear y me dediqué a decidir.
 
 ---
 
